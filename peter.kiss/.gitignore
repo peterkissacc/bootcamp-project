@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Local vector DB
+db/
+chroma/
+*.sqlite
+*.sqlite3
+*.parquet
+
+# OS / Editor junk
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
