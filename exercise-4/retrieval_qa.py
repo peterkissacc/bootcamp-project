@@ -1,11 +1,10 @@
-
 # src/qa/retrieval_qa.py
 # ------------------------------------------------------------
 # Basic RetrievalQA over Chroma with Azure OpenAI Chat (RAG)
-# - loads persistent Chroma built during ingest
-# - builds a retriever (k=5 by default) with optional metadata filters
-# - uses a grounded prompt: "Use only the provided context; otherwise say 'I don't know.'"
-# - prints the final answer + sources (track/album/artist)
+# - Loads persistent Chroma index from ROOT/db/chroma
+# - Retriever fetches documents based on semantic similarity
+# - Context builder includes AUDIO FEATURES (tempo, energy, etc.)
+# - LLM answers grounded in provided context
 # ------------------------------------------------------------
 
 import os
@@ -35,23 +34,29 @@ def _clean(s: str | None) -> str | None:
 
 
 def load_env() -> Dict[str, str]:
-    """Load Bootcamp-style env vars with both endpoint name variants supported."""
+    """Load env vars and calculate absolute path to the database."""
+    # 1. Locate .env (2 levels up from src/qa/)
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parents[1]  # .../BOOTCAMP-PROJECT
+    
     env_path = find_dotenv(usecwd=True)
     if not env_path:
-        # project root:  .../Spotify-quiz/.env
-        env_path = Path(__file__).resolve().parents[2] / ".env"
+        env_path = project_root / ".env"
+    
     load_dotenv(dotenv_path=env_path, override=False)
+
+    # 2. Define DB path relative to project root
+    default_chroma_path = project_root / "db" / "chroma"
 
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_OPENAI_API_ENDPOINT")
     cfg = {
         "AZURE_OPENAI_API_KEY": _clean(os.getenv("AZURE_OPENAI_API_KEY")),
         "AZURE_OPENAI_API_VERSION": _clean(os.getenv("AZURE_OPENAI_API_VERSION")),
         "AZURE_OPENAI_ENDPOINT": _clean(endpoint),
-        # Chat deployment (bootcamp szerint: gpt-4o-mini)
         "AZURE_OPENAI_DEPLOYMENT_NAME": _clean(os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")),
-        # Embedding deployment (ingestnél használtad)
         "AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS": _clean(os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS")),
-        "CHROMA_DIR": _clean(os.getenv("CHROMA_DIR", "./db/chroma")),
+        # Use absolute path ensures we find the DB regardless of where script is run
+        "CHROMA_DIR": _clean(os.getenv("CHROMA_DIR", str(default_chroma_path))),
     }
     missing = [k for k, v in cfg.items() if not v]
     if missing:
@@ -60,23 +65,47 @@ def load_env() -> Dict[str, str]:
 
 
 def format_docs(docs: List[Any]) -> str:
-    """Join retrieved docs into a compact context block (English app)."""
+    """
+    Join retrieved docs into a context block. 
+    UPDATED: Now explicitly extracts audio features from metadata to ensure the LLM sees them.
+    """
     chunks = []
     for d in docs:
         m = d.metadata or {}
-        name = m.get("name", "")
-        artists = m.get("artists", "")
-        album = m.get("album", "")
-        genre = m.get("genre", "")
+        
+        # Basic Info
+        name = m.get("name", "Unknown")
+        artists = m.get("artists", "Unknown")
+        album = m.get("album", "Unknown")
+        genre = m.get("genre", "Unknown")
         sid = m.get("id", "")
+        
+        # Audio Features (Extract these so the LLM can reason about 'mood', 'speed', etc.)
+        # We handle cases where they might be missing (defaults to N/A)
+        features = []
+        if "tempo" in m: features.append(f"Tempo: {m['tempo']} BPM")
+        if "energy" in m: features.append(f"Energy: {m['energy']}")
+        if "valence" in m: features.append(f"Valence (Mood): {m['valence']}")
+        if "danceability" in m: features.append(f"Danceability: {m['danceability']}")
+        if "popularity" in m: features.append(f"Popularity: {m['popularity']}")
+        if "explicit" in m: features.append(f"Explicit: {m['explicit']}")
+        
+        features_str = " | ".join(features)
+        
+        # The 'snippet' (page_content) usually contains the full text from ingest,
+        # but adding a structured header helps the LLM focus.
         snippet = d.page_content or ""
 
-        # Keep it compact to avoid token bloat; the model only needs essentials.
         chunks.append(
-            f"[TRACK] {name} | Artists: {artists} | Album: {album} | Genre: {genre} | SpotifyID: {sid}\n"
-            f"{snippet}\n"
+            f"[TRACK] {name}\n"
+            f" - Artists: {artists}\n"
+            f" - Album: {album}\n"
+            f" - Genre: {genre}\n"
+            f" - Audio Features: {features_str}\n"
+            f" - SpotifyID: {sid}\n"
+            f"--- Content dump ---\n{snippet}\n"
         )
-    return "\n---\n".join(chunks)
+    return "\n".join(chunks)
 
 
 def format_sources(docs: List[Any]) -> str:
@@ -89,7 +118,9 @@ def format_sources(docs: List[Any]) -> str:
         if key in seen:
             continue
         seen.add(key)
-        lines.append(f"- Track: {m.get('name')} | Album: {m.get('album')} | Artists: {m.get('artists')}")
+        # Show Genre and Popularity in sources to help user verify relevance
+        lines.append(f"- \"{m.get('name')}\" by {m.get('artists')} [{m.get('genre')}, Pop: {m.get('popularity')}]")
+    
     if not lines:
         return "- No sources found."
     return "\n".join(lines)
@@ -103,52 +134,56 @@ def build_chain(cfg: Dict[str, str], k: int = 5, where: Dict[str, Any] | None = 
     Build a Retrieval-Augmented Generation chain:
       question -> retriever(context) -> prompt -> Azure Chat -> answer
     """
-    # 1) Embeddings (same deployment as ingest)
+    # 1) Embeddings
     embeddings = AzureOpenAIEmbeddings(
-        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS"],  # Azure: deployment name
+        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS"],
         api_key=cfg["AZURE_OPENAI_API_KEY"],
         azure_endpoint=cfg["AZURE_OPENAI_ENDPOINT"],
         openai_api_version=cfg["AZURE_OPENAI_API_VERSION"],
     )
 
-    # 2) Vector store (persistent Chroma)
+    # 2) Vector store
+    if not os.path.exists(cfg["CHROMA_DIR"]):
+        print(f"[WARN] Database path does not exist: {cfg['CHROMA_DIR']}")
+    
     vectorstore = Chroma(
         persist_directory=cfg["CHROMA_DIR"],
         embedding_function=embeddings,
     )
 
-    # 3) Retriever (k & metadata filter)
+    # 3) Retriever
     search_kwargs = {"k": k}
     if where:
-        # For Chroma retriever, use 'where' to filter metadata server-side.
         search_kwargs["where"] = where
 
     retriever = vectorstore.as_retriever(search_kwargs=search_kwargs)
 
-    # 4) Chat model for generation (grounded by context)
+    # 4) Chat model
     llm = AzureChatOpenAI(
-        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME"],         # Azure: chat deployment name (e.g., gpt-4o-mini)
+        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME"],
         api_key=cfg["AZURE_OPENAI_API_KEY"],
         azure_endpoint=cfg["AZURE_OPENAI_ENDPOINT"],
         api_version=cfg["AZURE_OPENAI_API_VERSION"],
-        temperature=0.0,  # deterministic answers for QA
+        temperature=0.0,
     )
 
-    # 5) Grounded prompt (English app, strict about context)
+    # 5) Grounded prompt
+    # Updated system prompt to mention audio features
     prompt = ChatPromptTemplate.from_messages([
         ("system",
-         "You are a helpful assistant answering questions about tracks in a music catalog.\n"
-         "Use ONLY the provided context. If the answer is not present in the context, reply exactly: \"I don't know.\" "
-         "Be concise, precise, and include only the necessary details."),
+         "You are a music expert assistant. You answer questions based on a catalog of tracks.\n"
+         "The context includes metadata like 'Valence' (musical positiveness, 0.0-1.0), 'Energy', 'Danceability', and 'Tempo'.\n"
+         " - High Valence = Happy/Cheerful\n"
+         " - Low Valence = Sad/Depressing\n"
+         " - High Energy = Intense/Fast\n"
+         "Use ONLY the provided context. If the answer is not present, reply exactly: \"I don't know.\""),
         ("human",
          "Question:\n{question}\n\n"
-         "Context chunks (may be partial):\n{context}\n\n"
-         "Answer in 1-3 concise sentences. If the answer isn't in the context, say \"I don't know.\"")
+         "Context chunks:\n{context}\n\n"
+         "Answer in 1-3 concise sentences. Recommend tracks if they match the user's description.")
     ])
 
-    # 6) Build a small pipeline:
-    #    - left branch: retrieve docs -> format as context
-    #    - right branch: passthrough the user question
+    # 6) Pipeline
     retrieve_and_format = RunnableParallel(
         context=(retriever | format_docs),
         question=RunnablePassthrough()
@@ -156,7 +191,6 @@ def build_chain(cfg: Dict[str, str], k: int = 5, where: Dict[str, Any] | None = 
 
     chain = retrieve_and_format | prompt | llm | StrOutputParser()
 
-    # Expose vectorstore & retriever for debugging / evaluation (optional)
     return chain, retriever, vectorstore
 
 
@@ -164,16 +198,17 @@ def build_chain(cfg: Dict[str, str], k: int = 5, where: Dict[str, Any] | None = 
 # CLI runner
 # ---------------------------
 def main():
-    cfg = load_env()
+    try:
+        cfg = load_env()
+    except Exception as e:
+        print(f"[ERROR] Failed to load config: {e}")
+        return
 
-    # Example: you can set a default metadata filter here if desired
-    # (e.g., restrict to acoustic tracks)
-    default_filter = None
-    # default_filter = {"genre": "acoustic"}
+    # You can change k here if you need more candidates
+    chain, retriever, _ = build_chain(cfg, k=5, where=None)
 
-    chain, retriever, _ = build_chain(cfg, k=5, where=default_filter)
-
-    print("\n[READY] RetrievalQA is running. Type your question (English).")
+    print("\n[READY] RetrievalQA is running. Ask about songs, genres, or moods.")
+    print("Example: 'Suggest a high energy techno track' or 'Find me a sad acoustic song'.")
     print("Type 'exit' to quit.\n")
 
     while True:
@@ -190,22 +225,24 @@ def main():
             break
 
         # Run RAG chain
-        answer = chain.invoke(question)
+        print("Thinking...")
+        try:
+            answer = chain.invoke(question)
+        except Exception as e:
+            print(f"[ERROR] Chain invocation failed: {e}")
+            continue
 
-        # Also show the top-k docs (for sources)
-        # NOTE: invoke() already triggered retrieval internally; to show sources,
-        # we call the retriever again (cheap: vector search only).
+        # Fetch docs again just for displaying sources (cheap local lookup)
         try:
             docs = retriever.invoke(question)
         except AttributeError:
-            # fallback for older LC (rare)
             docs = retriever.get_relevant_documents(question)
 
         print("\n=== Answer ===")
         print(answer)
-        print("\n--- Sources ---")
+        print("\n--- Sources (Top 5 Matches) ---")
         print(format_sources(docs))
-        print("--------------\n")
+        print("-------------------------------\n")
 
 
 if __name__ == "__main__":

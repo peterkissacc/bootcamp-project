@@ -1,10 +1,8 @@
-
-# src/smoke_test/query_test.py
+# exercise-3/query_test.py
 # --------------------------------------------
 # Simple smoke test for Chroma retriever
-# - loads persistent Chroma index
-# - runs a semantic query
-# - demonstrates metadata filtering (genre='acoustic')
+# - Location: /exercise-3/query_test.py
+# - Target DB: /db/chroma (Root level)
 # --------------------------------------------
 
 import os
@@ -23,10 +21,19 @@ def _clean(s: str | None) -> str | None:
     return s
 
 def load_env():
+    # 1. Calculate paths based on this script being in "exercise-3/"
+    script_dir = Path(__file__).resolve().parent  # .../BOOTCAMP-PROJECT/exercise-3
+    project_root = script_dir.parent              # .../BOOTCAMP-PROJECT
+    
+    # 2. Find .env in project root
     env_path = find_dotenv(usecwd=True)
     if not env_path:
-        env_path = Path(__file__).resolve().parents[2] / ".env"
+        env_path = project_root / ".env"
+    
     load_dotenv(dotenv_path=env_path, override=False)
+
+    # 3. Define default DB path (Root level)
+    default_chroma_path = project_root / "db" / "chroma"
 
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_OPENAI_API_ENDPOINT")
     cfg = {
@@ -34,7 +41,8 @@ def load_env():
         "AZURE_OPENAI_API_VERSION": _clean(os.getenv("AZURE_OPENAI_API_VERSION")),
         "AZURE_OPENAI_ENDPOINT": _clean(endpoint),
         "AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS": _clean(os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS")),
-        "CHROMA_DIR": _clean(os.getenv("CHROMA_DIR", "./db/chroma")),
+        # Use absolute path to the root 'db/chroma'
+        "CHROMA_DIR": _clean(os.getenv("CHROMA_DIR", str(default_chroma_path))),
     }
     missing = [k for k, v in cfg.items() if not v]
     if missing:
@@ -44,59 +52,63 @@ def load_env():
 def main():
     cfg = load_env()
 
-    # Recreate the same embeddings used during ingest
+    # Recreate embeddings
     embeddings = AzureOpenAIEmbeddings(
-        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS"],   # Azure: deployment name
+        model=cfg["AZURE_OPENAI_DEPLOYMENT_NAME_EMBEDDINGS"],
         api_key=cfg["AZURE_OPENAI_API_KEY"],
         azure_endpoint=cfg["AZURE_OPENAI_ENDPOINT"],
         openai_api_version=cfg["AZURE_OPENAI_API_VERSION"],
     )
 
-    # Load existing Chroma index (must match ingest CHROMA_DIR)
+    # Load Chroma
+    print(f"[INFO] Loading Chroma index from: {cfg['CHROMA_DIR']}")
+    
+    if not os.path.exists(cfg["CHROMA_DIR"]):
+        print(f"[ERROR] Database not found at {cfg['CHROMA_DIR']}! Did you run the ingest script?")
+        return
+
     vectorstore = Chroma(
         persist_directory=cfg["CHROMA_DIR"],
         embedding_function=embeddings,
     )
 
-    print("\n[INFO] Chroma index loaded.")
-    print(f"[INFO] Persist directory: {cfg['CHROMA_DIR']}")
+    print("[INFO] Chroma index loaded successfully.")
 
-    # --- 1) Simple similarity search (no filter)
-    query = "Find an acoustic track by Frank Ocean"
+    # --- 1) Simple similarity search
+    # We use a generic query because we don't know exactly which songs are in the first N rows
+    query = "sad acoustic songs" 
+    print(f"\n[TEST 1] Similarity Search Query: '{query}'")
+    
     docs = vectorstore.similarity_search(query, k=5)
-    print(f"\n[TEST 1] Query: {query}")
+    
     if not docs:
         print("[WARN] No results returned.")
     else:
         for i, d in enumerate(docs, start=1):
             m = d.metadata
-            print(f"  [{i}] name='{m.get('name')}', artists='{m.get('artists')}', album='{m.get('album')}', genre='{m.get('genre')}'")
+            print(f"  [{i}] {m.get('name')} | Artist: {m.get('artists')} | Genre: {m.get('genre')}")
 
-    # --- 2) Similarity search with metadata filter (genre='acoustic')
-    print("\n[TEST 2] Same query with metadata filter: genre='acoustic'")
-    # langchain_chroma exposes a ._collection.query in some versions, but prefer retriever API:
+    # --- 2) Metadata filter test
+    # Ensure this genre actually exists in your ingested subset!
+    target_genre = "acoustic" 
+    print(f"\n[TEST 2] Metadata Filter: genre='{target_genre}'")
+    
     retriever = vectorstore.as_retriever(search_kwargs={
         "k": 5,
-        "where": {"genre": "acoustic"}     # Chroma metadata filter
+        "where": {"genre": target_genre}
     })
-    docs_filtered = retriever.get_relevant_documents(query)
+    
+    try:
+        docs_filtered = retriever.invoke(query)
+    except AttributeError:
+        docs_filtered = retriever.get_relevant_documents(query)
+
     if not docs_filtered:
-        print("[WARN] No results with filter (genre='acoustic'). Try removing the filter or change the query.")
+        print(f"[WARN] No results for genre '{target_genre}'. (This is normal if you ingested a small subset that lacks this genre).")
     else:
         for i, d in enumerate(docs_filtered, start=1):
             m = d.metadata
-            print(f"  [{i}] name='{m.get('name')}', artists='{m.get('artists')}', album='{m.get('album')}', genre='{m.get('genre')}'")
-
-    # --- 3) Another quick query example (album-oriented)
-    another_query = "Which album contains the track 'Cayendo (Side A - Acoustic)'?"
-    print(f"\n[TEST 3] Query: {another_query}")
-    docs2 = vectorstore.similarity_search(another_query, k=3)
-    if not docs2:
-        print("[WARN] No results.")
-    else:
-        for i, d in enumerate(docs2, start=1):
-            m = d.metadata
-            print(f"  [{i}] name='{m.get('name')}', album='{m.get('album')}', artists='{m.get('artists')}', genre='{m.get('genre')}'")
+            print(f"  [{i}] {m.get('name')} | Genre: {m.get('genre')} | Popularity: {m.get('popularity')}")
 
     print("\n[DONE] Smoke test completed.")
 
