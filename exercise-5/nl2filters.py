@@ -28,35 +28,23 @@ class RangeOp(BaseModel):
 
 class NLFilter(BaseModel):
     genre: Optional[Union[str, Dict[str, List[str]]]] = None
-    key: Optional[int] = None   # 0-11
-    mode: Optional[int] = None  # 0: minor, 1: major
-    explicit: Optional[bool] = None
+    key: Optional[int] = None
+    mode: Optional[int] = None
     popularity: Optional[RangeOp] = None
     energy: Optional[RangeOp] = None
-    danceability: Optional[RangeOp] = None
-    valence: Optional[RangeOp] = None
     tempo: Optional[RangeOp] = None
-    instrumentalness: Optional[RangeOp] = None
-    acousticness: Optional[RangeOp] = None
-    limit: Optional[int] = None
-    sort_by: Optional[Literal["popularity_desc", "popularity_asc"]] = None
+    limit: Optional[int] = 5  # Defaulting to 5 if not found
 
-SYSTEM_PROMPT = """You are a Music Theory & Search Specialist. Convert requests to JSON.
+def build_user_prompt(user_request: str) -> str:
+    """Enhanced prompt to ensure the limit is extracted correctly."""
+    return f"""Convert this music request to a JSON filter. 
+User request: "{user_request}"
 
-KEY MAPPING: C=0, C#/Db=1, D=2, D#/Eb=3, E=4, F=5, F#/Gb=6, G=7, G#/Ab=8, A=9, A#/Bb=10, B=11
-MODE MAPPING: minor=0, major=1
-
-RULES:
-- Multiple genres (e.g. "pop or rock") -> {{"genre": {{"$in": ["pop", "rock"]}}}}
-- "fast" -> tempo > 140, "energetic" -> energy > 0.8, "chill" -> energy < 0.4
-- If a specific key is mentioned (e.g. "C minor"), set "key" and "mode".
-
-EXAMPLES:
-User: "pop song in c minor"
-JSON: {{"genre": "pop", "key": 0, "mode": 0, "limit": 5}}
-
-STRICT RULE: Return ONLY JSON. Use double braces for all JSON structure.
-Example: {{"limit": 1, "genre": "techno"}}"""
+STRICT RULES:
+1. If the user mentions a number (e.g., '15 songs', '7 tracks'), set the "limit" field to that EXACT number.
+2. If the user says 'all', set "limit" to 100.
+3. Use the schema: {{"genre": string, "limit": int, "popularity": {{"$gt": int}}}}
+4. Return ONLY the JSON object. No prose."""
 
 def interpret_nl_to_filter(raw_llm_json: str) -> NLFilter:
     try:
@@ -66,6 +54,6 @@ def interpret_nl_to_filter(raw_llm_json: str) -> NLFilter:
         data = json.loads(raw_llm_json)
         return NLFilter.model_validate(data)
     except:
-        return NLFilter()
+        return NLFilter(limit=5)
 
 NLFilter.model_rebuild()
