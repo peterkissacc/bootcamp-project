@@ -31,7 +31,7 @@ def get_cfg():
 def get_llm(temp=0):
     cfg = get_cfg()
     return AzureChatOpenAI(azure_deployment=cfg["deployment"], api_version=cfg["api_version"], 
-                          azure_endpoint=cfg["endpoint"], api_key=cfg["api_key"], temperature=temp)
+                           azure_endpoint=cfg["endpoint"], api_key=cfg["api_key"], temperature=temp)
 
 def get_embeddings():
     cfg = get_cfg()
@@ -54,12 +54,13 @@ def orchestrator_node(state: AgentState) -> Dict:
     THE BRAIN: 
     1. Analyzes User Intent (Playlist vs Info).
     2. Performs Cumulative Math (for playlists).
-    3. Categorizes Search Terms (Artist vs Vibe).
+    3. Categorizes Search Terms (Artist vs Song vs Vibe vs Genre).
+    4. Translates Activities to Vibes.
     """
     log_entry = "🧠 [ORCHESTRATOR] Analyzing request..."
     llm = get_llm()
     
-    # FIX: Double curly braces {{ }} for literal JSON examples
+    # UPDATED: REWROTE PROMPT TO ENFORCE 'DELTA ONLY' LOGIC & GENRE PRESERVATION
     system_prompt = """You are a Music Assistant / Orchestrator.
     
     YOUR GOAL:
@@ -70,20 +71,29 @@ def orchestrator_node(state: AgentState) -> Dict:
        - If the user wants to create/edit a list, intent is "playlist".
        - If the user asks a factual question (fastest, longest, who is), intent is "info".
     
-    2. **Playlist Math (Cumulative)**:
-       - Review the history. If the user says "Add 2 Prodigy", and they previously had "2 Metallica", 
-         the plan must include BOTH.
-       - Output the TOTAL target count for each item.
+    2. **Playlist Edits (Additions) -- CRITICAL RULE**:
+       - If the user says "add 1 more", "add 2 more", etc.:
+         a) **DO NOT** re-list the songs/artists already in the playlist.
+         b) **DO NOT** guess specific new artists (like "Led Zeppelin") unless the user named them.
+         c) **REUSE** the *Broadest* search term from history (e.g., "Rock", "Fast songs").
+         d) Set "count" to the number of **NEW** items requested (e.g., 1 or 2).
+       - Example: User "Add 1 more" -> Action: Term="Rock", Category="genre", Count=1.
     
-    3. **Categorization**:
-       - Tag every search term as "artist" (specific name) or "vibe" (genre/mood/description).
-       - Examples: 
-         - "Metallica" -> "artist"
-         - "Chill songs" -> "vibe"
-         - "Fast rock" -> "vibe"
-         - "Michael Jackson" -> "artist"
+    3. **Term Translation (Activity -> Vibe) & Genre Preservation**:
+       - If the user mentions an **ACTIVITY** (e.g., "Running", "Workout", "Sleeping", "Studying"), do NOT search for that word literally.
+       - **TRANSLATE** it into a musical VIBE or GENRE description.
+       - **CRITICAL**: If a specific **GENRE** is also mentioned (e.g., "Rock", "Pop", "Metal"), you **MUST INCLUDE IT** in the translation.
+       - Bad Example: "Rock music for workout" -> term: "High Tempo Energetic" (MISSING GENRE).
+       - Good Example: "Rock music for workout" -> term: "High Tempo Rock", category: "vibe".
     
-    4. **Sorting (For Info)**:
+    4. **Categorization**:
+       - Tag every search term as "artist", "song", "genre", or "vibe".
+       - **Artist**: Specific name of a person or band (e.g., "Metallica").
+       - **Song**: Specific title of a track.
+       - **Genre**: A specific musical style (e.g., "Techno", "Rock").
+       - **Vibe**: Adjectives, moods, or descriptions (e.g., "Chill", "Fast").
+    
+    5. **Sorting (For Info)**:
        - If the user asks for "fastest", set "sort": "fastest".
        - If "longest", set "sort": "longest".
     
@@ -93,16 +103,21 @@ def orchestrator_node(state: AgentState) -> Dict:
       "actions": [
         {{
           "term": "Search Term",
-          "count": "Integer (Total)",
-          "category": "artist" | "vibe",
+          "count": "Integer (Items to Add)",
+          "category": "artist" | "song" | "genre" | "vibe",
           "sort": "fastest" | "longest" | null
         }}
       ]
     }}
     
-    EXAMPLE (Playlist):
+    EXAMPLE 1 (New List):
     User: "2 Metallica and 3 chill songs"
     Output: {{ "intent": "playlist", "actions": [ {{ "term": "Metallica", "count": 2, "category": "artist" }}, {{ "term": "Relaxing Chill Music", "count": 3, "category": "vibe" }} ] }}
+
+    EXAMPLE 2 (Add More - Contextual):
+    History: [User created a Rock playlist]
+    User: "Add 1 more"
+    Output: {{ "intent": "playlist", "actions": [ {{ "term": "Rock", "count": 1, "category": "genre" }} ] }}
     """
     
     prompt = ChatPromptTemplate.from_messages([
@@ -126,9 +141,47 @@ def orchestrator_node(state: AgentState) -> Dict:
         else:
             raise ValueError("No JSON found in LLM response")
     except Exception as e:
-        # Emergency Fallback: Treat as a generic info search
-        plan = {"intent": "info", "actions": [{"term": state["query"], "category": "vibe", "count": 5}]}
-        log_detail = f"   ❌ Planning Failed: {e}. Using fallback to INFO."
+        # Emergency Fallback: Intelligent heuristic
+        # If the LLM fails, we perform SMART RECOVERY based on history
+        q_lower = state["query"].lower()
+        
+        # 1. Intent Guess
+        fallback_intent = "info"
+        if any(w in q_lower for w in ["playlist", "list", "create", "add", "make"]):
+            fallback_intent = "playlist"
+            
+        # 2. Count Guess
+        fallback_count = 5 
+        count_match = re.search(r"\b\d+\b", state["query"])
+        if count_match:
+            fallback_count = int(count_match.group(0))
+        elif "add" in q_lower:
+            fallback_count = 2 # Default for "add more"
+            
+        # 3. Context Recovery (FIX for "Add 2 more")
+        fallback_term = state["query"]
+        fallback_category = "vibe"
+        
+        # If query is very short/generic (e.g. "add 2 more"), look back in history
+        is_generic_request = len(state["query"].split()) < 5 and ("add" in q_lower or "more" in q_lower)
+        
+        if is_generic_request:
+            # Iterate backwards through history to find the last Human Message that wasn't this one
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, HumanMessage) and msg.content != state["query"]:
+                    fallback_term = msg.content # Use the previous user message as the search term
+                    log_entry += f"\n   🔄 Context Recovery: Interpreted '{state['query']}' as '{fallback_term}'"
+                    break
+
+        plan = {
+            "intent": fallback_intent, 
+            "actions": [{
+                "term": fallback_term, 
+                "category": fallback_category, 
+                "count": fallback_count
+            }]
+        }
+        log_detail = f"   ❌ Planning Failed: {e}. Using intelligent fallback: Searching '{fallback_term}' (Count: {fallback_count})."
         
     return {"plan": plan, "logs": [log_entry, log_detail]}
 
@@ -136,7 +189,7 @@ def executor_node(state: AgentState) -> Dict:
     """
     THE TOOL:
     Executes the 'Waterfall Search Strategy'.
-    Stage 1: Exact Metadata Match (High Precision)
+    Stage 1: Exact Metadata Match (High Precision) - Now supports Artist, Genre AND Song (Name)
     Stage 2: Strict Vector Match (Medium Precision)
     Stage 3: Semantic Vibe Match (Low Precision, High Recall)
     """
@@ -147,103 +200,200 @@ def executor_node(state: AgentState) -> Dict:
     logs = [f"💾 [EXECUTOR] Running {len(actions)} actions..."]
     vectorstore = Chroma(persist_directory=get_cfg()["chroma_dir"], embedding_function=get_embeddings())
     
-    all_results = []
+    # --- 1. CONTEXT PRESERVATION (Accumulation Logic) ---
+    # UPDATED: Start with existing results if intent is playlist, so we don't lose previous songs.
+    if intent == "playlist":
+        previous_results = state.get("results", []) or []
+        if previous_results:
+            logs.append(f"   🔄 Context: Keeping {len(previous_results)} existing tracks in the list.")
+    else:
+        previous_results = []
+
+    new_results_to_add = [] 
     global_seen = set()
     
+    # Mark existing items as 'seen' to prevent duplicates
+    for r in previous_results:
+        key = f"{r.get('name', r.get('title'))}-{r.get('artists')}"
+        global_seen.add(key)
+    
+    # --- 2. EXECUTION LOOP ---
     for action in actions:
         term = action.get("term", "Music")
         category = action.get("category", "vibe")
         sort_mode = action.get("sort", None)
         
-        # Info intent needs more candidates for sorting; Playlist needs specific count
         target_count = action.get("count", 5) if intent == "playlist" else 50
         
-        logs.append(f"   🔍 Processing: '{term}' [{category.upper()}] Target: {target_count}")
+        # --- FIXED: SMART LIMIT CALCULATION ---
+        # Determine if 'target_count' is a Total Goal (e.g., 7) or just New Items (e.g., 2) based on history.
+        limit = target_count 
+        
+        if intent == "playlist":
+            current_total = len(previous_results)
+            # If requested total is significantly larger than current, assume it's a Total Goal.
+            if target_count > current_total:
+                limit = target_count - current_total
+            # If requested total is small (<= current), assume it's a Delta (e.g., "Add 2").
+            else:
+                limit = target_count
+        else:
+            limit = 50 # Info intent gets plenty
+            
+        logs.append(f"   🔍 Processing: '{term}' [{category.upper()}] Adding: {limit}")
         
         # --- WATERFALL STAGE 1: EXACT METADATA FILTER ---
-        # (Only applicable if category is 'artist')
+        # (Applicable if category is 'artist', 'genre' OR 'song')
         stage1_docs = []
+        
         if category == "artist":
             try:
-                # Direct lookup: Extremely fast and accurate for exact names
                 meta_response = vectorstore.get(where={"artists": term})
                 if meta_response and meta_response['ids']:
                     for i in range(len(meta_response['ids'])):
                         d = meta_response['metadatas'][i]
-                        d['match_type'] = "Stage 1 (Exact Metadata)"
+                        d['match_type'] = "Stage 1 (Exact Metadata - Artist)"
                         stage1_docs.append(d)
                 logs.append(f"      -> Stage 1 (Metadata): Found {len(stage1_docs)} exact matches.")
-            except:
-                pass # Fallback if metadata lookup fails
-        
+            except: pass 
+
+        elif category == "genre":
+            try:
+                meta_response = vectorstore.get(where={"genre": term})
+                if meta_response and meta_response['ids']:
+                    for i in range(len(meta_response['ids'])):
+                        d = meta_response['metadatas'][i]
+                        d['match_type'] = "Stage 1 (Exact Metadata - Genre)"
+                        stage1_docs.append(d)
+                logs.append(f"      -> Stage 1 (Metadata): Found {len(stage1_docs)} exact matches.")
+            except: pass
+
+        elif category == "song": 
+            # UPDATED: Added logic for Song Title Lookup (Trying 'name' then 'title')
+            try:
+                # First try "name"
+                meta_response = vectorstore.get(where={"name": term})
+                if meta_response and meta_response['ids']:
+                    for i in range(len(meta_response['ids'])):
+                        d = meta_response['metadatas'][i]
+                        d['match_type'] = "Stage 1 (Exact Metadata - Song Name)"
+                        stage1_docs.append(d)
+                
+                # If nothing found, try "title" (fallback for schema diffs)
+                if not stage1_docs:
+                    meta_response = vectorstore.get(where={"title": term})
+                    if meta_response and meta_response['ids']:
+                        for i in range(len(meta_response['ids'])):
+                            d = meta_response['metadatas'][i]
+                            d['match_type'] = "Stage 1 (Exact Metadata - Song Title)"
+                            stage1_docs.append(d)
+
+                logs.append(f"      -> Stage 1 (Metadata): Found {len(stage1_docs)} exact matches.")
+            except: pass
+
         # --- WATERFALL STAGE 2: VECTOR SEARCH + STRICT FILTER ---
-        # (Used if Stage 1 didn't fill the quota, or for generic terms)
         stage2_docs = []
-        # We assume stage 1 docs are effectively 'Document' objects for sorting logic later
-        # But here we need to run vector search to find things *like* the term
         
         # Fetch deep candidates (x5 target) to ensure we have enough to filter
-        candidate_docs = vectorstore.similarity_search(term, k=max(target_count * 5, 50))
+        candidate_docs = vectorstore.similarity_search(term, k=max(limit * 5, 50))
         
+        # UPDATED: Debug Log for DB Schema
+        if candidate_docs:
+             keys = list(candidate_docs[0].metadata.keys())
+             logs.append(f"      ℹ️ [DB SCHEMA DEBUG] Available fields: {keys}")
+
         for d in candidate_docs:
-            artist_name = d.metadata.get("artists", "").lower()
             term_lower = term.lower()
+            field_to_check = ""
             
-            # Check strict containment (e.g. "Metallica" in "Metallica")
-            if term_lower in artist_name:
-                d.metadata['match_type'] = "Stage 2 (Strict Vector)"
+            if category == "artist":
+                field_to_check = d.metadata.get("artists", "").lower()
+            elif category == "genre":
+                field_to_check = d.metadata.get("genre", "").lower()
+            elif category == "song":
+                # Check both common keys for song titles
+                name_val = d.metadata.get("name", "")
+                title_val = d.metadata.get("title", "")
+                field_to_check = (name_val + " " + title_val).lower()
+
+            # Check strict containment 
+            if field_to_check and term_lower in field_to_check:
+                d.metadata['match_type'] = f"Stage 2 (Strict Vector - {category.capitalize()})"
                 stage2_docs.append(d.metadata)
         
         # --- WATERFALL STAGE 3: SEMANTIC VIBE MATCH ---
-        # (Only used if category is 'vibe' OR if strict matches failed)
         stage3_docs = []
-        if category == "vibe":
+        
+        # We allow Stage 3 for Vibe, OR if we need backfill for Others
+        if category == "vibe" or (len(stage1_docs) + len(stage2_docs) < limit):
             for d in candidate_docs:
-                # Apply Semantic Logic:
-                # If searching for "Slow", exclude "Fast" songs via tempo check
                 bpm = d.metadata.get("tempo", 120)
                 if "slow" in term.lower() and bpm > 110: continue
                 if "fast" in term.lower() and bpm < 130: continue
                 
-                d.metadata['match_type'] = "Stage 3 (Semantic Vibe)"
+                # If we are here for a Genre/Artist search that failed strict matching, 
+                # we tag it as Semantic fallback.
+                d.metadata['match_type'] = "Stage 3 (Semantic Vibe/Fallback)"
                 stage3_docs.append(d.metadata)
 
-        # --- SELECTION LOGIC ---
+        # --- SELECTION LOGIC (UPDATED FOR DUPLICATE SKIPPING) ---
         selected_metas = []
         
-        # Priority 1: Exact Metadata (Stage 1)
-        selected_metas.extend(stage1_docs)
-        
-        # Priority 2: Strict Vector (Stage 2) - Deduping against Stage 1
-        for m in stage2_docs:
-            if len(selected_metas) >= target_count and intent == "playlist": break
+        # Priority 1: Stage 1 Docs (Metadata Exact)
+        for m in stage1_docs:
+            if len(selected_metas) >= limit and intent == "playlist": break
             
-            # Simple dedup check
-            is_dup = any(x['name'] == m['name'] and x['artists'] == m['artists'] for x in selected_metas)
-            if not is_dup:
-                selected_metas.append(m)
+            # CRITICAL FIX: Check History Before Adding from Stage 1
+            t_name = m.get('name', m.get('title', 'Unknown'))
+            t_artist = m.get('artists', 'Unknown')
+            g_key = f"{t_name}-{t_artist}"
+            
+            if g_key in global_seen: continue # Skip if already in list
+            
+            is_dup = any(x.get('name', x.get('title')) == m.get('name', m.get('title')) and x.get('artists') == m.get('artists') for x in selected_metas)
+            if not is_dup: selected_metas.append(m)
+        
+        # Priority 2: Stage 2 Docs (Strict Vector)
+        for m in stage2_docs: 
+            if len(selected_metas) >= limit and intent == "playlist": break
+            
+            # CRITICAL FIX: Check History Before Adding from Stage 2
+            t_name = m.get('name', m.get('title', 'Unknown'))
+            t_artist = m.get('artists', 'Unknown')
+            g_key = f"{t_name}-{t_artist}"
+            
+            if g_key in global_seen: continue # Skip if already in list
 
-        # Priority 3: Vibe Match (Stage 3) - Only if we still need songs AND category is 'vibe'
-        # (Or if strict failed completely for an artist search, though rare)
-        if len(selected_metas) < target_count and category == "vibe":
-            remaining = target_count - len(selected_metas)
-            logs.append(f"      -> Filling {remaining} slots with Semantic/Vibe matches.")
-            count_added = 0
-            for m in stage3_docs:
-                if count_added >= remaining: break
-                is_dup = any(x['name'] == m['name'] and x['artists'] == m['artists'] for x in selected_metas)
-                if not is_dup:
-                    selected_metas.append(m)
-                    count_added += 1
+            is_dup = any(x.get('name', x.get('title')) == m.get('name', m.get('title')) and x.get('artists') == m.get('artists') for x in selected_metas)
+            if not is_dup: selected_metas.append(m)
+
+        # Priority 3: Stage 3 Docs (Semantic Fallback)
+        if len(selected_metas) < limit: 
+            remaining = limit - len(selected_metas)
+            
+            if category == "vibe" or len(selected_metas) == 0: 
+                logs.append(f"      -> Filling {remaining} slots with Semantic/Vibe matches.")
+                count_added = 0
+                for m in stage3_docs:
+                    if count_added >= remaining: break
+                    
+                    # CRITICAL FIX: Check History Before Adding from Stage 3
+                    t_name = m.get('name', m.get('title', 'Unknown'))
+                    t_artist = m.get('artists', 'Unknown')
+                    g_key = f"{t_name}-{t_artist}"
+                    if g_key in global_seen: continue
+
+                    is_dup = any(x.get('name', x.get('title')) == m.get('name', m.get('title')) and x.get('artists') == m.get('artists') for x in selected_metas)
+                    if not is_dup:
+                        selected_metas.append(m)
+                        count_added += 1
 
         # --- SORTING (For Info Intent) ---
         if intent == "info" and sort_mode:
             logs.append(f"      -> Sorting results by: {sort_mode}")
             if "fast" in sort_mode or "tempo" in sort_mode:
                 selected_metas.sort(key=lambda x: x.get('tempo', 0), reverse=True)
-                # Decorate for UI
-                for m in selected_metas:
-                    m['debug_info'] = f"BPM: {round(m.get('tempo', 0))}"
+                for m in selected_metas: m['debug_info'] = f"BPM: {round(m.get('tempo', 0))}"
             elif "long" in sort_mode:
                 selected_metas.sort(key=lambda x: x.get('duration_ms', 0), reverse=True)
                 for m in selected_metas:
@@ -251,51 +401,50 @@ def executor_node(state: AgentState) -> Dict:
                     secs = int((m.get('duration_ms', 0) % 60000) / 1000)
                     m['debug_info'] = f"Duration: {mins}:{secs:02d}"
 
-        # --- FINAL COMMIT ---
-        limit = target_count if intent == "playlist" else 5
-        count_committed = 0
+        # --- FINAL COMMIT FOR THIS ACTION ---
+        count_committed_for_this_action = 0
         
         for m in selected_metas[:limit]:
-            key = f"{m.get('name')}-{m.get('artists')}"
+            # Generate Unique Key
+            track_name = m.get('name', m.get('title', 'Unknown'))
+            key = f"{track_name}-{m.get('artists')}"
+            
+            # Add ONLY if not in Global Seen (Previous + Current)
             if key not in global_seen:
                 m["source"] = "DB"
-                all_results.append(m)
+                new_results_to_add.append(m)
                 global_seen.add(key)
-                count_committed += 1
+                count_committed_for_this_action += 1
         
-        logs.append(f"      -> Final Committed: {count_committed}/{target_count}")
+        logs.append(f"      -> Added: {count_committed_for_this_action}/{limit}")
 
+    # --- 3. MERGE RESULTS ---
+    # Combine Old + New
+    final_results = previous_results + new_results_to_add
+    
     # --- LLM FALLBACK (Ghost Entries) ---
-    # Only for playlists: If we promised X songs but found < X, generate placeholders
     if intent == "playlist":
-        for action in actions:
-            term = action.get("term")
-            req_count = action.get("count", 1)
-            
-            # Count how many we actually provided for this term
-            # (Heuristic: checks if artist name contains term OR match_type exists (vibe))
-            found_actual = 0
-            for r in all_results:
-                if term.lower() in r.get("artists", "").lower():
-                    found_actual += 1
-                elif r.get("match_type") == "Stage 3 (Semantic Vibe)":
-                     # This logic assumes sequential processing order roughly holds, 
-                     # but for simplicity we assume Vibe matches count towards the Vibe target
-                     found_actual += 1
-            
-            # Simple total check is safer to prevent over-generation
-            # We compare total results vs total requested
-            pass 
+        # FIXED: Correctly calculate missing items based on Grand Total Goal vs Actual.
+        total_requested_in_actions = sum(a.get("count", 0) for a in actions)
         
-        # Total padding logic
-        total_requested = sum(a.get("count", 1) for a in actions)
-        if len(all_results) < total_requested:
-            missing = total_requested - len(all_results)
-            logs.append(f"      -> ⚠️ List short by {missing}. Generating LLM suggestions.")
-            for i in range(missing):
-                all_results.append({"name": f"Suggested Track {i+1}", "artists": "Unknown", "source": "LLM"})
+        # Calculate the Grand Total Goal
+        # If the requested count was a Total (e.g. 7), goal is 7.
+        # If requested count was a Delta (e.g. 2), goal is Previous + 2.
+        if total_requested_in_actions > len(previous_results):
+             grand_total_goal = total_requested_in_actions
+        else:
+             grand_total_goal = len(previous_results) + total_requested_in_actions
 
-    return {"results": all_results, "logs": logs}
+        current_total = len(final_results)
+        
+        if current_total < grand_total_goal:
+            missing = grand_total_goal - current_total
+            if missing > 0:
+                logs.append(f"      -> ⚠️ List short by {missing}. Generating LLM suggestions.")
+                for i in range(missing):
+                    final_results.append({"name": f"Suggested Track {i+1}", "artists": "Unknown", "source": "LLM"})
+
+    return {"results": final_results, "logs": logs}
 
 def synthesizer_node(state: AgentState) -> Dict:
     """
@@ -311,14 +460,14 @@ def synthesizer_node(state: AgentState) -> Dict:
         sys_msg = "The database search yielded NO results. Answer from your general knowledge. Label the source as [LLM]."
         context = "DB Results: None."
     else:
-        # --- NEW FEATURE: Explanations and Detail ---
         sys_msg = """You are a Music Assistant.
         1. Explain the solution based on the provided DB Results.
         2. Label sources as [DB] if present.
         3. IF CREATING A PLAYLIST:
-           - List every track found.
-           - Show key details provided in the DB results (e.g., Artist, BPM, Genre, Duration).
-           - CRITICAL: Add a short (4-5 words) explanation for EACH song on why it fits the request (e.g., 'Matches the chill vibe' or 'High tempo for running')."""
+            - List every track found.
+            - Show key details provided in the DB results (e.g., Artist, BPM, Genre, Duration).
+            - Include Album Name, Energy, and Popularity.
+            - CRITICAL: Add a short (4-5 words) explanation for EACH song on why it fits the request (e.g., 'Matches the chill vibe' or 'High tempo for running')."""
         
         context = json.dumps(results, indent=2)
     
@@ -332,7 +481,7 @@ def synthesizer_node(state: AgentState) -> Dict:
 
 # --- 4. GRAPH ---
 def build_graph(checkpointer):
-    builder = StateGraph(AgentState)
+    builder = StateGraph(AgentState)            
     builder.add_node("orchestrator", orchestrator_node)
     builder.add_node("executor", executor_node)
     builder.add_node("synthesizer", synthesizer_node)

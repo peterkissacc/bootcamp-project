@@ -19,3 +19,6 @@ chroma/
 
 # Secrets
 .env
+
+# Migration Folder
+rag-js-migration/

@@ -74,9 +74,9 @@ ui = gr.ChatInterface(
     title="🎵 AI Music Curator (Debug Mode)",
     description="Full transparency demo. See exactly how the AI thinks, filters, and sorts.",
     examples=[
-        "Create a list with 2 Metallica and 1 Prodigy song",
-        "Add 2 more Prodigy songs",
-        "What is the fastest Michael Jackson song?",
+        "Create an energetic playlist for running",
+        "Add 2 more songs",
+        "Who wrote the song 'Imagine'?",
     ]
 )
 
